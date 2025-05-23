@@ -1,7 +1,7 @@
 mod db;
 mod server;
-mod utils;
 mod types;
+mod utils;
 
 use actix_web::{App, HttpServer};
 use server::ChatServer;
@@ -19,15 +19,14 @@ async fn main() -> Result<()> {
 
     let (chat_server, server_tx) = ChatServer::new();
 
-    let chat_server = spawn(chat_server.run());
+    let chat_server_handle = spawn(chat_server.run());
 
     let http_server = HttpServer::new(move || App::new())
         .workers(4)
         .bind(("0.0.0.0", 8080))?
-        .run()
-        .await;
+        .run();
 
-    tokio::try_join!(http_server, async move { chat_server.await.unwrap() })?;
+    try_join!(http_server, async move { chat_server_handle.await.unwrap() })?;
 
     Ok(())
 }

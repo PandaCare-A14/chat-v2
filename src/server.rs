@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use mongodb::bson::{Timestamp, Uuid, oid::ObjectId};
+use tokio::io;
 use tokio::sync::mpsc::{self};
 
 pub type ConnId = Uuid;
@@ -43,14 +44,21 @@ impl ChatServer {
         )
     }
 
-    pub async fn run(&self) {
-        match self.cmd_rx.recv().await.unwrap() {
+    pub async fn run(mut self) -> io::Result<()> {
+        match &self.cmd_rx.recv().await.unwrap() {
             Command::SendMessage {
                 message,
                 conn_id,
                 room_id,
-            } => self.rooms.get(&room_id),
-        }
+            } => {
+                self.rooms.get(&room_id);
+            }
+            Command::JoinRoom { user_id } => {
+                user_id;
+            }
+        };
+
+        Ok(())
     }
 }
 
