@@ -1,67 +1,103 @@
-use std::collections::{HashMap, HashSet};
+use actix_web::{
+    HttpRequest, HttpResponse, Responder,
+    web::{self},
+};
+use futures::TryStreamExt;
+use jsonwebtoken::DecodingKey;
+use mongodb::{
+    Client,
+    bson::{self, Binary, doc},
+};
 
-use mongodb::bson::{Timestamp, Uuid, oid::ObjectId};
-use tokio::io;
-use tokio::sync::mpsc::{self};
+use crate::{
+    chat_server::Message,
+    db::get_message_collection,
+    utils::{get_access_token_from_auth_header, get_user_details},
+};
 
-pub type ConnId = Uuid;
-pub type RoomId = Uuid;
-pub type UserId = Uuid;
-
-struct Message {
-    message_id: ObjectId,
-    timestamp: Timestamp,
-    last_updated: Timestamp,
-    content: String,
+pub fn rest_scope(cfg: &mut web::ServiceConfig) {
+    cfg.service(get_rooms);
 }
 
-enum Command {
-    JoinRoom {
-        user_id: UserId,
-    },
-    SendMessage {
-        message: Message,
-        conn_id: ConnId,
-        room_id: RoomId,
-    },
-}
+#[actix_web::get("/chat/rooms")]
+async fn get_rooms(
+    req: HttpRequest,
+    client: web::Data<Client>,
+    verifying_key: web::Data<DecodingKey>,
+) -> impl Responder {
+    let client = client.get_ref().clone();
 
-pub struct ChatServer {
-    rooms: HashMap<RoomId, HashSet<ConnId>>,
-    cmd_rx: mpsc::UnboundedReceiver<Command>,
-}
+    let token_str = match get_access_token_from_auth_header(req) {
+        Some(token) => token,
+        None => return HttpResponse::Unauthorized().body("User is invalid"),
+    };
 
-impl ChatServer {
-    pub fn new() -> (Self, ChatServerHandle) {
-        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<Command>();
+    let user = match get_user_details(&token_str, verifying_key.get_ref()) {
+        Ok(user) => user,
+        Err(_err) => return HttpResponse::Unauthorized().body("User is invalid"),
+    };
 
-        (
-            Self {
-                rooms: HashMap::new(),
-                cmd_rx,
-            },
-            ChatServerHandle { cmd_tx },
-        )
-    }
+    let messages = get_message_collection(&client);
 
-    pub async fn run(mut self) -> io::Result<()> {
-        match &self.cmd_rx.recv().await.unwrap() {
-            Command::SendMessage {
-                message,
-                conn_id,
-                room_id,
-            } => {
-                self.rooms.get(&room_id);
+    let query_pipeline = vec![
+        doc! {
+            "$match": {
+                "$or": [
+                    { "sender_id": &user.user_id() },
+                    { "recipient_id": &user.user_id() }
+                ]
             }
-            Command::JoinRoom { user_id } => {
-                user_id;
+        },
+        doc! {
+            "$addFields": {
+                "chat_partner_id": {
+                    "$cond": [
+                        { "$eq": ["$sender_id", &user.user_id()] },
+                        "$recipient_id",
+                        "$sender_id"
+                    ]
+                }
             }
+        },
+        doc! {
+            "$sort": { "timestamp": 1 } // chronological order
+        },
+        doc! {
+            "$group": {
+                "_id": "$chat_partner_id",
+                "messages": { "$push": "$$ROOT" }
+            }
+        },
+    ];
+
+    let mut rooms = match messages.aggregate(query_pipeline).await {
+        Ok(rooms) => rooms,
+        Err(err) => return HttpResponse::InternalServerError().body(err.to_string()),
+    };
+
+    let mut room_vec: Vec<(Binary, Vec<Message>)> = Vec::new();
+
+    while let Some(room) = rooms.try_next().await.unwrap() {
+        let partner_id = match room.get("_id") {
+            Some(bson::Bson::Binary(binary)) if binary.subtype == bson::spec::BinarySubtype::Uuid => binary.bytes.clone(),
+            _ => return HttpResponse::InternalServerError().body("Invalid or missing '_id' field"),
         };
 
-        Ok(())
-    }
-}
+        if let Ok(msgs) = room.get_array("messages") {
+            let messages: Vec<Message> = msgs
+                .iter()
+                .filter_map(|val| bson::from_bson::<Message>(val.clone()).ok())
+                .collect();
 
-pub struct ChatServerHandle {
-    cmd_tx: mpsc::UnboundedSender<Command>,
+            room_vec.push((
+                Binary {
+                    subtype: bson::spec::BinarySubtype::Uuid,
+                    bytes: partner_id,
+                },
+                messages,
+            ))
+        }
+    }
+
+    HttpResponse::Ok().json(room_vec)
 }
